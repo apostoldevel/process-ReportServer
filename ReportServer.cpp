@@ -558,7 +558,7 @@ namespace Apostol {
 #if defined(_GLIBCXX_RELEASE) && (_GLIBCXX_RELEASE >= 9)
                 new CReportHandler(this, ANotify->extra, [this](auto &&Handler) { DoReport(Handler); });
 #else
-                new CReportHandler(this, ANotify->extra, std::bind(&CReportServer::DoFetch, this, _1));
+                new CReportHandler(this, ANotify->extra, std::bind(&CReportServer::DoReport, this, _1));
 #endif
                 UnloadQueue();
             }
