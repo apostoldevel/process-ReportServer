@@ -1,4 +1,4 @@
-Сервер сообщений
+Сервер отчётов
 -
 **Процесс** для [Апостол CRM](https://github.com/apostoldevel/apostol-crm).
 
