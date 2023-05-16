@@ -45,8 +45,6 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CReportProcess::BeforeRun() {
-            sigset_t set;
-
             Application()->Header(Application()->Name() + ": report server");
 
             Log()->Debug(APP_LOG_DEBUG_CORE, MSG_PROCESS_START, GetProcessName(), Application()->Header().c_str());
@@ -59,7 +57,7 @@ namespace Apostol {
 
             InitializePQClients(Application()->Title(), 1, m_MaxMessagesQueue);
 
-            SigProcMask(SIG_UNBLOCK, SigAddSet(&set));
+            SigProcMask(SIG_UNBLOCK);
 
             SetTimerInterval(1000);
         }
