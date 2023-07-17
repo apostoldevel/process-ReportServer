@@ -99,6 +99,8 @@ namespace Apostol {
             m_Agent = CString().Format("Report Server (%s)", GApplication->Title().c_str());
             m_Host = CApostolModule::GetIPByHostName(CApostolModule::GetHostName());
 
+            m_Conf = PG_CONFIG_NAME;
+
             m_CheckDate = 0;
             m_AuthDate = 0;
 
@@ -601,6 +603,22 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
+        CPQPollQuery *CReportServer::GetQuery(CPollConnection *AConnection) {
+            CPQPollQuery *pQuery = m_pModuleProcess->GetQuery(AConnection, m_Conf);
+
+            if (Assigned(pQuery)) {
+#if defined(_GLIBCXX_RELEASE) && (_GLIBCXX_RELEASE >= 9)
+                pQuery->OnPollExecuted([this](auto && APollQuery) { DoPostgresQueryExecuted(APollQuery); });
+                pQuery->OnException([this](auto && APollQuery, auto && AException) { DoPostgresQueryException(APollQuery, AException); });
+#else
+                pQuery->OnPollExecuted(std::bind(&CFileServer::DoPostgresQueryExecuted, this, _1));
+                pQuery->OnException(std::bind(&CFileServer::DoPostgresQueryException, this, _1, _2));
+#endif
+            }
+
+            return pQuery;
+        }
+
         void CReportServer::Heartbeat(CDateTime Now) {
             if ((Now >= m_AuthDate)) {
                 m_AuthDate = Now + (CDateTime) 5 / SecsPerDay; // 5 sec
@@ -637,6 +655,9 @@ namespace Apostol {
         }
         //--------------------------------------------------------------------------------------------------------------
 
+        bool CReportServer::CheckLocation(const CLocation &Location) {
+            return false;
+        }
     }
 }
 }
