@@ -70,6 +70,7 @@ namespace Apostol {
             CStringList m_Sessions;
             CStringList m_Reports;
 
+            CString m_Conf;
             CString m_Agent;
             CString m_Host;
 
@@ -119,9 +120,12 @@ namespace Apostol {
                 return new CReportServer(AProcess);
             }
 
+            CPQPollQuery *GetQuery(CPollConnection *AConnection) override;
+
             void Heartbeat(CDateTime Now) override;
             void UnloadQueue() override;
             bool Enabled() override;
+            bool CheckLocation(const CLocation &Location) override;
 
             void Reload();
 
