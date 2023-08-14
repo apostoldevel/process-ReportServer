@@ -125,8 +125,6 @@ namespace Apostol {
 
             void Reload();
 
-            void ExecuteReport(CQueueHandler *AHandler);
-
         };
     }
 }
