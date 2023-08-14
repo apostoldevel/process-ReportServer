@@ -611,13 +611,14 @@ namespace Apostol {
                 pQuery->OnPollExecuted([this](auto && APollQuery) { DoPostgresQueryExecuted(APollQuery); });
                 pQuery->OnException([this](auto && APollQuery, auto && AException) { DoPostgresQueryException(APollQuery, AException); });
 #else
-                pQuery->OnPollExecuted(std::bind(&CFileServer::DoPostgresQueryExecuted, this, _1));
-                pQuery->OnException(std::bind(&CFileServer::DoPostgresQueryException, this, _1, _2));
+                pQuery->OnPollExecuted(std::bind(&CReportServer::DoPostgresQueryExecuted, this, _1));
+                pQuery->OnException(std::bind(&CReportServer::DoPostgresQueryException, this, _1, _2));
 #endif
             }
 
             return pQuery;
         }
+        //--------------------------------------------------------------------------------------------------------------
 
         void CReportServer::Heartbeat(CDateTime Now) {
             if ((Now >= m_AuthDate)) {
