@@ -120,8 +120,6 @@ namespace Apostol {
                 return new CReportServer(AProcess);
             }
 
-            CPQPollQuery *GetQuery(CPollConnection *AConnection) override;
-
             void Heartbeat(CDateTime Now) override;
             void UnloadQueue() override;
             bool Enabled() override;

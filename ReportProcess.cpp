@@ -25,6 +25,8 @@ Author:
 #include "ReportProcess.hpp"
 //----------------------------------------------------------------------------------------------------------------------
 
+#define PG_CONFIG_NAME "helper"
+
 extern "C++" {
 
 namespace Apostol {
@@ -38,7 +40,7 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         CReportProcess::CReportProcess(CCustomProcess *AParent, CApplication *AApplication):
-                inherited(AParent, AApplication, ptCustom, "report server process") {
+                inherited(AParent, AApplication, ptCustom, "report server") {
 
             m_MaxMessagesQueue = Config()->PostgresPollMin();
         }
@@ -70,7 +72,7 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CReportProcess::Run() {
-            auto &PQClient = PQClientStart(_T("helper"));
+            auto &PQClient = PQClientStart(PG_CONFIG_NAME);
 
             while (!sig_exiting) {
 
