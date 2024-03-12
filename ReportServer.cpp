@@ -273,7 +273,7 @@ namespace Apostol {
 
                     EnumReportReady(session, pqResults[QUERY_INDEX_DATA]);
                 } catch (Delphi::Exception::Exception &E) {
-                    DoError(E);
+                    DoFatal(E);
                 }
             };
 
@@ -482,18 +482,19 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CReportServer::DoFatal(const Delphi::Exception::Exception &E) {
+            DoError(E);
+
             m_AuthDate = Now() + (CDateTime) SLEEP_SECOND_AFTER_ERROR / SecsPerDay; // 10 sec;
             m_CheckDate = m_AuthDate;
 
             m_Status = Process::psStopped;
 
-            Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
-            Log()->Notice("[ReportServer] Continue after %d seconds", SLEEP_SECOND_AFTER_ERROR);
+            Log()->Notice("[%s] Continue after %d seconds", ModuleName().c_str(), SLEEP_SECOND_AFTER_ERROR);
         }
         //--------------------------------------------------------------------------------------------------------------
 
         void CReportServer::DoError(const Delphi::Exception::Exception &E) {
-            Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
+            Log()->Error(APP_LOG_ERR, 0, "[%s] %s", ModuleName().c_str(), E.what());
         }
         //--------------------------------------------------------------------------------------------------------------
 
@@ -532,7 +533,7 @@ namespace Apostol {
             auto pHandler = dynamic_cast<CReportHandler *> (AHandler);
 
             if (IndexOfReports(pHandler->ReportId()) >= 0) {
-                Log()->Error(APP_LOG_WARN, 0, "[%s] Report already in progress.", pHandler->ReportId().c_str());
+                Log()->Error(APP_LOG_WARN, 0, "[%s] [%s] Report already in progress.", ModuleName().c_str(), pHandler->ReportId().c_str());
                 DeleteHandler(AHandler);
                 return;
             }
@@ -628,7 +629,7 @@ namespace Apostol {
 
             m_Status = Process::psStopped;
 
-            Log()->Notice("[ReportServer] Reloading...");
+            Log()->Notice("[%s] Reloading...", ModuleName().c_str());
         }
         //--------------------------------------------------------------------------------------------------------------
 
