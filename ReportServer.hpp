@@ -1,136 +1,109 @@
-/*++
+#pragma once
 
-Program name:
+#ifdef WITH_POSTGRESQL
 
-  Apostol CRM
+#include "apostol/process_module.hpp"
+#include "apostol/bot_session.hpp"
+#include "apostol/pg.hpp"
 
-Module Name:
+#include <chrono>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
 
-  ReportServer.hpp
+namespace apostol
+{
 
-Notices:
+class Application;
+class EventLoop;
+class Logger;
 
-  Module: Report Server
+// --- ReportServer ------------------------------------------------------------
+//
+// Background process module that executes pre-defined database reports.
+//
+// Mirrors v1 CReportServer from apostol-crm.
+//
+// Architecture: logic lives here (ProcessModule), injected into a generic
+// ModuleProcess shell via add_custom_process(unique_ptr<ProcessModule>).
+//
+// Report lifecycle:
+//   - Authenticates as "apibot" via OAuth2 client_credentials (BotSession)
+//   - Subscribes to PostgreSQL LISTEN "report" channel for immediate dispatch
+//   - Polls api.report_ready('enabled') every minute as fallback
+//   - For each report in "progress" state: api.execute_report_ready(id)
+//   - On success: execute_object_action(id, 'complete')
+//   - On cancel:  execute_object_action(id, 'abort')
+//   - On error:   execute_object_action(id, 'fail') + set_object_label(id, error)
+//
+// NOTIFY payload format on the "report" channel:
+//   {"session": "...", "id": "<report-uuid>"}
+//
+// Configuration (in apostol.json):
+//   "module": {
+//     "ReportServer": {
+//       "enable": true,
+//       "heartbeat": 60000
+//     }
+//   }
+//
+class ReportServer final : public ProcessModule
+{
+public:
+    std::string_view name() const override { return "report-server"; }
 
-Author:
+    void on_start(EventLoop& loop, Application& app) override;
+    void heartbeat(std::chrono::system_clock::time_point now) override;
+    void on_stop() override;
 
-  Copyright (c) Prepodobny Alen
+private:
+    using time_point   = std::chrono::system_clock::time_point;
+    using milliseconds = std::chrono::milliseconds;
 
-  mailto: alienufo@inbox.ru
-  mailto: ufocomp@gmail.com
+    // -- State ----------------------------------------------------------------
 
---*/
+    PgPool*     pool_{nullptr};
+    Logger*     logger_{nullptr};
 
-#ifndef APOSTOL_REPORT_SERVER_HPP
-#define APOSTOL_REPORT_SERVER_HPP
-//----------------------------------------------------------------------------------------------------------------------
+    std::unique_ptr<BotSession> bot_;
 
-extern "C++" {
+    enum class Status { stopped, running };
+    Status status_{Status::stopped};
 
-namespace Apostol {
+    struct Report { std::string id; time_point started_at; };
+    std::unordered_map<std::string, Report> reports_;
 
-    namespace Module {
+    // Pending report IDs from NOTIFY (processed in heartbeat)
+    std::vector<std::string> pending_reports_;
 
-        //--------------------------------------------------------------------------------------------------------------
+    time_point   next_check_{};
+    milliseconds check_interval_{60'000};  // 1 minute
 
-        //-- CReportHandler --------------------------------------------------------------------------------------------
+    // -- NOTIFY ---------------------------------------------------------------
+    void on_notify(std::string_view payload);
+    void process_notify_queue();
 
-        //--------------------------------------------------------------------------------------------------------------
+    // -- Polling fallback -----------------------------------------------------
+    void check_reports();
+    void enum_reports(std::vector<PgResult> results);
 
-        class CReportHandler: public CQueueHandler {
-        private:
+    // -- Report lifecycle -----------------------------------------------------
+    void do_check(const std::string& id);
+    void do_start(const std::string& id);
+    void do_complete(const std::string& id);
+    void do_abort(const std::string& id);
+    void do_fail(const std::string& id, const std::string& error);
 
-            CString m_Session;
-            CString m_ReportId;
+    void execute_action(const std::string& id, std::string_view action,
+                        PgQuery::ResultHandler on_result);
+    void delete_report(const std::string& id);
+    bool in_progress(const std::string& id) const;
 
-            CJSON m_Payload;
+    void on_fatal(const std::string& error);
+};
 
-        public:
+} // namespace apostol
 
-            CReportHandler(CQueueCollection *ACollection, const CString &Data, COnQueueHandlerEvent && Handler);
-
-            const CString &Session() const { return m_Session; }
-            const CString &ReportId() const { return m_ReportId; }
-
-            const CJSON &Payload() const { return m_Payload; }
-
-        };
-
-        //--------------------------------------------------------------------------------------------------------------
-
-        //-- CReportServer ---------------------------------------------------------------------------------------------
-
-        //--------------------------------------------------------------------------------------------------------------
-
-        class CReportServer: public CQueueCollection, public CApostolModule {
-        private:
-
-            CProcessStatus m_Status;
-
-            CStringList m_Sessions;
-            CStringList m_Reports;
-
-            CString m_Conf;
-            CString m_Agent;
-            CString m_Host;
-
-            CDateTime m_CheckDate;
-            CDateTime m_AuthDate;
-
-            void InitMethods() override;
-
-            void InitListen();
-            void CheckListen();
-
-            void Authentication();
-            void SignOut(const CString &Session);
-
-            int IndexOfReports(const CString &Id);
-            int AddReport(const CString &Id);
-            int DeleteReport(const CString &Id);
-
-            void EnumReportReady(const CString &Session, const CPQueryResult &List);
-            void CheckReportReady();
-
-        protected:
-
-            void DoFatal(const Delphi::Exception::Exception &E);
-            void DoError(const Delphi::Exception::Exception &E);
-
-            void DoStart(const CString &Session, const CString &Id);
-            void DoComplete(const CString &Session, const CString &Id);
-            void DoAbort(const CString &Session, const CString &Id);
-            void DoCancel(const CString &Session, const CString &Id);
-            void DoFail(const CString &Session, const CString &Id, const CString &Error);
-
-            void DoReport(CQueueHandler *AHandler);
-
-            void DoPostgresNotify(CPQConnection *AConnection, PGnotify *ANotify) override;
-
-            void DoPostgresQueryExecuted(CPQPollQuery *APollQuery) override;
-            void DoPostgresQueryException(CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) override;
-
-        public:
-
-            explicit CReportServer(CModuleProcess *AProcess);
-
-            ~CReportServer() override = default;
-
-            static class CReportServer *CreateModule(CModuleProcess *AProcess) {
-                return new CReportServer(AProcess);
-            }
-
-            void Heartbeat(CDateTime Now) override;
-            void UnloadQueue() override;
-            bool Enabled() override;
-            bool CheckLocation(const CLocation &Location) override;
-
-            void Reload();
-
-        };
-    }
-}
-
-using namespace Apostol::Module;
-}
-#endif //APOSTOL_REPORT_SERVER_HPP
+#endif // WITH_POSTGRESQL

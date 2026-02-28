@@ -2,46 +2,80 @@
 
 Сервер отчётов
 -
-**ReportServer** — процесс для [Apostol](https://github.com/apostoldevel/apostol) + [db-platform](https://github.com/apostoldevel/db-platform) — **Apostol CRM**[^crm].
+
+**Процесс** для [Apostol](https://github.com/apostoldevel/apostol) + [db-platform](https://github.com/apostoldevel/db-platform) — **Apostol CRM**[^crm].
 
 Описание
 -
-**ReportServer** выполняет заранее подготовленные отчёты из базы данных в асинхронном режиме. Отчёт — это PL/pgSQL-процедура, зарегистрированная в очереди отчётов; процесс извлекает её, выполняет как запрос PostgreSQL и обновляет состояние отчёта по завершении.
 
-Процесс работает независимо внутри мастер-процесса Апостол, используя общий цикл событий на основе `epoll` — без потоков, без блокирующего ввода-вывода.
+**Сервер отчётов** — фоновый процесс-модуль для фреймворка [Апостол](https://github.com/apostoldevel/apostol). Запускается как отдельный форкнутый процесс и выполняет заранее подготовленные отчёты из базы данных в асинхронном режиме. Отчёт — это PL/pgSQL-процедура, зарегистрированная в очереди отчётов; процесс извлекает её, выполняет как запрос PostgreSQL и обновляет состояние отчёта по завершении.
 
-Архитектура
--
-`CReportProcess` — обёртка на уровне ОС-процесса. Она содержит `CReportServer`, который наследует `CQueueCollection` и `CApostolModule` и реализует логику выполнения отчётов.
+Основные характеристики:
 
-Принцип работы
--
-1. Авторизуется через OAuth2 `client_credentials` как `apibot`; повторная авторизация каждые 24 часа.
-2. Подписывается на PostgreSQL-канал уведомлений `report` через `LISTEN report`.
-3. Каждую минуту опрашивает `api.report_ready('enabled')` как резервный механизм.
-4. Для каждого отчёта в состоянии `progress` вызывает `api.execute_report_ready(id)`.
-5. По завершении — `api.execute_object_action(id, 'complete')`.
-6. При отмене — отменяет активный PQ-запрос, затем `api.execute_object_action(id, 'abort')`.
-7. При ошибке — `api.execute_object_action(id, 'fail')`.
+* Написан на C++20 с использованием асинхронной неблокирующей модели ввода-вывода на базе **epoll** API.
+* Подключается к **PostgreSQL** через библиотеку `libpq`, используя роль `apibot` (пул соединений helper).
+* Аутентифицируется через OAuth2 `client_credentials` с помощью `BotSession` — повторная аутентификация каждые 24 часа.
+* **NOTIFY-driven**: подписывается на PostgreSQL-канал `LISTEN report` для немедленной обработки.
+* **Polling-fallback**: каждую минуту проверяет `api.report_ready('enabled')` для обнаружения пропущенных уведомлений.
+* Обрабатывает ошибки: для неуспешных отчётов сохраняется сообщение об ошибке; при критических ошибках сервер приостанавливается на 10 секунд.
 
-Формат полезной нагрузки уведомления в канале `report`:
+### Архитектура
+
+Сервер отчётов следует паттерну **ProcessModule**, введённому в apostol.v2:
+
+```
+Application
+  └── ModuleProcess (generic-оболочка процесса: сигналы, EventLoop, PgPool)
+        └── ReportServer (ProcessModule: только бизнес-логика)
+```
+
+Жизненный цикл процесса (обработка сигналов, crash recovery, настройка PgPool, таймер heartbeat) управляется generic-оболочкой `ModuleProcess`. `ReportServer` содержит только логику выполнения отчётов.
+
+### Как это работает
+
+```
+heartbeat (1 сек)
+  └── BotSession::refresh_if_needed()
+  └── если аутентифицирован:
+        └── process_notify_queue()  — немедленная обработка NOTIFY
+        └── если now >= next_check_ (1 мин):
+              └── check_reports()   — polling-fallback
+                    └── api.authorize(session)
+                    └── api.report_ready('enabled') ORDER BY created
+                    └── enum_reports():
+                          для каждого отчёта:
+                            progress && !in_progress → do_start(id)
+                              └── api.execute_report_ready(id)
+                              └── успех   → do_complete() → action 'complete'
+                              └── ошибка  → do_fail()  → action 'fail' + set_object_label
+                            canceled && in_progress → do_abort(id)
+                              └── api.execute_object_action(id, 'abort')
+
+NOTIFY "report" → on_notify(payload):
+  парсинг JSON → id
+  если !in_progress → pending_reports_.push(id)
+  → обрабатывается на следующем heartbeat через do_check(id)
+    └── api.get_report_ready(id)
+    └── если statecode == "progress" → do_start(id)
+```
+
+### Формат NOTIFY payload
 
 ```json
 {"session": "...", "id": "<report-uuid>"}
 ```
 
-Жизненный цикл отчёта
--
+### Машина состояний отчёта (db-platform)
 
-| Состояние | Действие |
-|-----------|---------|
-| `progress` | Выполнить `api.execute_report_ready(id)` |
-| _(запрос завершён)_ | `execute_object_action('complete')` |
-| `canceled` _(во время выполнения)_ | Отменить PQ-запрос → `execute_object_action('abort')` |
-| _(ошибка запроса)_ | `execute_object_action('fail')` |
+```
+created ──enable──► enabled ──execute──► progress ──complete──► completed
+                                                   ──fail────► failed
+                                                   ──cancel──► canceled ──abort──► aborted
+```
 
 Модуль базы данных
 -
+
 ReportServer тесно связан с модулем **`report`** платформы [db-platform](https://github.com/apostoldevel/db-platform) (`db/sql/platform/report/`).
 
 Отчёт состоит из четырёх частей:
@@ -64,17 +98,34 @@ ReportServer тесно связан с модулем **`report`** платфо
 | `api.execute_object_action(id, action)` | Переходы состояний: `'complete'`, `'abort'`, `'cancel'`, `'fail'` |
 | `api.get_report_ready(id)` | Получает запись report_ready с текущим состоянием |
 
-Настройка
+Конфигурация
 -
-```ini
-[module/ReportServer]
-enable=true
+
+В конфигурационном файле приложения (`conf/apostol.json`):
+
+```json
+{
+  "module": {
+    "ReportServer": {
+      "enable": true,
+      "heartbeat": 60000
+    }
+  }
+}
 ```
 
-> **Важно:** Секция конфигурации — `module/ReportServer`, а не `process/ReportServer`. Это связано с тем, что встроенный модуль `CReportServer` читает флаг `enable` из пространства имён `module/`.
+| Параметр | Тип | По умолчанию | Описание |
+|----------|-----|-------------|----------|
+| `enable` | bool | `false` | Включить/отключить процесс |
+| `heartbeat` | int | `60000` | Интервал проверки отчётов в миллисекундах |
+
+Также необходимы:
+* Строка подключения `postgres.helper` в конфигурации (используется для пула соединений `apibot`)
+* Учётные данные OAuth2 `service` в файле `conf/oauth2/default.json`
 
 Установка
 -
-Следуйте указаниям по сборке и установке [Апостол](https://github.com/apostoldevel/apostol#%D1%81%D0%B1%D0%BE%D1%80%D0%BA%D0%B0-%D0%B8-%D1%83%D1%81%D1%82%D0%B0%D0%BD%D0%BE%D0%B2%D0%BA%D0%B0).
+
+Следуйте указаниям по сборке и установке [Апостол](https://github.com/apostoldevel/apostol#building-and-installation).
 
 [^crm]: **Apostol CRM** — абстрактный термин, а не самостоятельный продукт. Он обозначает любой проект, в котором совместно используются фреймворк [Apostol](https://github.com/apostoldevel/apostol) (C++) и [db-platform](https://github.com/apostoldevel/db-platform) через специально разработанные модули и процессы. Каждый фреймворк можно использовать независимо; вместе они образуют полноценную backend-платформу.

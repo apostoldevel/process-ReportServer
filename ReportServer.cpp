@@ -1,648 +1,371 @@
-/*++
+#ifdef WITH_POSTGRESQL
 
-Program name:
+#include "ReportServer/ReportServer.hpp"
 
-  Apostol CRM
+#include "apostol/application.hpp"
+#include "apostol/pg_utils.hpp"
 
-Module Name:
+#include <fmt/format.h>
+#include <nlohmann/json.hpp>
 
-  ReportServer.cpp
+namespace apostol
+{
 
-Notices:
+// --- on_start ----------------------------------------------------------------
 
-  Module: Report Server
+void ReportServer::on_start(EventLoop& /*loop*/, Application& app)
+{
+    pool_   = &app.db_pool();
+    logger_ = &app.logger();
 
-Author:
+    // Create BotSession for apibot authentication
+    bot_ = std::make_unique<BotSession>(*pool_, "ReportServer/1.0", "localhost");
 
-  Copyright (c) Prepodobny Alen
+    // Read OAuth2 credentials from conf/oauth2/default.json -> "service" app
+    auto [client_id, client_secret] = app.providers().credentials("service");
+    if (!client_id.empty())
+        bot_->set_credentials(std::move(client_id), std::move(client_secret));
 
-  mailto: alienufo@inbox.ru
-  mailto: ufocomp@gmail.com
+    // Subscribe to LISTEN "report" for immediate dispatch
+    pool_->listen("report", [this](std::string_view /*channel*/, std::string_view payload) {
+        on_notify(payload);
+    });
 
---*/
-
-//----------------------------------------------------------------------------------------------------------------------
-
-#include "Core.hpp"
-#include "ReportServer.hpp"
-//----------------------------------------------------------------------------------------------------------------------
-
-#define API_BOT_USERNAME "apibot"
-
-#define QUERY_INDEX_AUTH     0
-#define QUERY_INDEX_DATA     1
-
-#define SLEEP_SECOND_AFTER_ERROR 10
-
-#define PG_CONFIG_NAME "helper"
-#define PG_LISTEN_NAME "report"
-//----------------------------------------------------------------------------------------------------------------------
-
-extern "C++" {
-
-namespace Apostol {
-
-    namespace BackEnd {
-
-        namespace api {
-
-            void report_ready(CStringList &SQL, const CString &State) {
-                SQL.Add(CString().Format("SELECT * FROM api.report_ready(%s::text) ORDER BY created;", PQQuoteLiteral(State).c_str()));
-            }
-            //----------------------------------------------------------------------------------------------------------
-
-            void get_report_ready(CStringList &SQL, const CString &Id) {
-                SQL.Add(CString().MaxFormatSize(256 + Id.Size())
-                                .Format("SELECT id, statecode FROM api.get_report_ready(%s::uuid)",
-                                        PQQuoteLiteral(Id).c_str()
-                                ));
-            }
-            //----------------------------------------------------------------------------------------------------------
-
-            void execute_report_ready(CStringList &SQL, const CString &Id) {
-                SQL.Add(CString().MaxFormatSize(256 + Id.Size())
-                                .Format("SELECT * FROM api.execute_report_ready(%s::uuid)",
-                                        PQQuoteLiteral(Id).c_str()
-                                ));
-            }
-            //----------------------------------------------------------------------------------------------------------
-
-        }
+    // Read heartbeat interval from config
+    if (auto* cfg = app.module_config("ReportServer")) {
+        if (cfg->contains("heartbeat") && (*cfg)["heartbeat"].is_number())
+            check_interval_ = milliseconds((*cfg)["heartbeat"].get<int>());
     }
 
-    namespace Module {
+    logger_->notice("ReportServer started (check_interval={}ms)",
+                    check_interval_.count());
+}
 
-        //--------------------------------------------------------------------------------------------------------------
+// --- heartbeat ---------------------------------------------------------------
 
-        //-- CReportHandler --------------------------------------------------------------------------------------------
+void ReportServer::heartbeat(std::chrono::system_clock::time_point now)
+{
+    if (!bot_ || !pool_)
+        return;
 
-        //--------------------------------------------------------------------------------------------------------------
+    bot_->refresh_if_needed();
 
-        CReportHandler::CReportHandler(CQueueCollection *ACollection, const CString &Data, COnQueueHandlerEvent && Handler):
-                CQueueHandler(ACollection, static_cast<COnQueueHandlerEvent &&> (Handler)) {
+    if (status_ == Status::stopped) {
+        if (bot_->valid())
+            status_ = Status::running;
+        return;
+    }
 
-            m_Payload = Data;
+    // Status::running
+    process_notify_queue();
 
-            m_Session = m_Payload["session"].AsString();
-            m_ReportId = m_Payload["id"].AsString();
+    if (now >= next_check_) {
+        check_reports();
+        next_check_ = now + check_interval_;
+    }
+}
+
+// --- on_stop -----------------------------------------------------------------
+
+void ReportServer::on_stop()
+{
+    if (pool_)
+        pool_->unlisten("report");
+    if (bot_)
+        bot_->sign_out();
+    bot_.reset();
+}
+
+// --- on_notify ---------------------------------------------------------------
+//
+// Called from PgPool listener when a NOTIFY arrives on the "report" channel.
+// Payload format: {"session": "...", "id": "<report-uuid>"}
+//
+
+void ReportServer::on_notify(std::string_view payload)
+{
+    try {
+        auto j = nlohmann::json::parse(payload);
+        if (j.contains("id") && j["id"].is_string()) {
+            auto id = j["id"].get<std::string>();
+            if (!id.empty() && !in_progress(id))
+                pending_reports_.push_back(std::move(id));
         }
+    } catch (const nlohmann::json::exception& e) {
+        if (logger_)
+            logger_->error("ReportServer: bad NOTIFY payload: {}", e.what());
+    }
+}
 
-        //--------------------------------------------------------------------------------------------------------------
+// --- process_notify_queue ----------------------------------------------------
 
-        //-- CReportServer ---------------------------------------------------------------------------------------------
+void ReportServer::process_notify_queue()
+{
+    if (pending_reports_.empty())
+        return;
 
-        //--------------------------------------------------------------------------------------------------------------
+    // Move out to avoid re-entrancy issues
+    auto pending = std::move(pending_reports_);
+    pending_reports_.clear();
 
-        CReportServer::CReportServer(CModuleProcess *AProcess): CQueueCollection(Config()->PostgresPollMin()),
-                CApostolModule(AProcess, "report server", "module/ReportServer") {
+    for (auto& id : pending) {
+        if (!in_progress(id))
+            do_check(id);
+    }
+}
 
-            m_Agent = CString().Format("%s (%s)", GApplication->Title().c_str(), ModuleName().c_str());
-            m_Host = CApostolModule::GetIPByHostName(CApostolModule::GetHostName());
+// --- check_reports -----------------------------------------------------------
+//
+// Polling fallback (every check_interval_):
+//   1. api.authorize(session)
+//   2. api.report_ready('enabled') ORDER BY created
+//
 
-            m_Conf = PG_CONFIG_NAME;
+void ReportServer::check_reports()
+{
+    if (!bot_->valid())
+        return;
 
-            m_CheckDate = 0;
-            m_AuthDate = 0;
+    auto sql = fmt::format(
+        "SELECT * FROM api.authorize({});\n"
+        "SELECT * FROM api.report_ready('enabled') ORDER BY created",
+        pq_quote_literal(bot_->session()));
 
-            m_Status = Process::psStopped;
+    pool_->execute(sql,
+        [this](std::vector<PgResult> results) {
+            enum_reports(std::move(results));
+        },
+        [this](std::string_view error) {
+            on_fatal(std::string(error));
+        },
+        /*quiet=*/true);
+}
+
+// --- enum_reports ------------------------------------------------------------
+//
+// Mirrors v1 CReportServer::EnumReportReady():
+//   For each report in results:
+//     - state == "progress" && !in_progress -> do_start
+//     - state == "canceled" && in_progress  -> do_abort
+//
+
+void ReportServer::enum_reports(std::vector<PgResult> results)
+{
+    // results[0] = authorize, results[1] = report_ready list
+    if (results.size() < 2 || !results[1].ok())
+        return;
+
+    auto& res = results[1];
+    int rows = res.rows();
+
+    int col_id        = res.column_index("id");
+    int col_statecode = res.column_index("statecode");
+
+    if (col_id < 0 || col_statecode < 0)
+        return;
+
+    for (int r = 0; r < rows; ++r) {
+        std::string id    = res.value(r, col_id)        ? res.value(r, col_id)        : "";
+        std::string state = res.value(r, col_statecode) ? res.value(r, col_statecode) : "";
+
+        if (id.empty())
+            continue;
+
+        if (in_progress(id)) {
+            if (state == "canceled")
+                do_abort(id);
+        } else {
+            if (state == "progress")
+                do_start(id);
         }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::InitMethods() {
-
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::InitListen() {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-                try {
-                    auto pResult = APollQuery->Results(0);
-
-                    if (pResult->ExecStatus() != PGRES_COMMAND_OK) {
-                        throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
-                    }
-
-                    APollQuery->Connection()->Listeners().Add(PG_LISTEN_NAME);
-#if defined(_GLIBCXX_RELEASE) && (_GLIBCXX_RELEASE >= 9)
-                    APollQuery->Connection()->OnNotify([this](auto && APollQuery, auto && ANotify) { DoPostgresNotify(APollQuery, ANotify); });
-#else
-                    APollQuery->Connection()->OnNotify(std::bind(&CReportServer::DoPostgresNotify, this, _1, _2));
-#endif
-                } catch (Delphi::Exception::Exception &E) {
-                    DoError(E);
-                }
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            };
-
-            CStringList SQL;
-
-            SQL.Add("LISTEN " PG_LISTEN_NAME ";");
-
-            try {
-                ExecSQL(SQL, nullptr, OnExecuted, OnException);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::CheckListen() {
-            if (!PQClient(PG_CONFIG_NAME).CheckListen(PG_LISTEN_NAME))
-                InitListen();
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::Authentication() {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-
-                CPQueryResults pqResults;
-
-                CStringList SQL;
-
-                try {
-                    CApostolModule::QueryToResults(APollQuery, pqResults);
-
-                    const auto &login = pqResults[0];
-                    const auto &sessions = pqResults[1];
-
-                    const auto &session = login.First()["session"];
-
-                    m_Sessions.Clear();
-                    for (int i = 0; i < sessions.Count(); ++i) {
-                        m_Sessions.Add(sessions[i]["get_sessions"]);
-                    }
-
-                    m_AuthDate = Now() + (CDateTime) 24 / HoursPerDay;
-                    m_Status = psRunning;
-
-                    SignOut(session);
-                } catch (Delphi::Exception::Exception &E) {
-                    DoFatal(E);
-                }
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            };
-
-            const auto &caProviders = Server().Providers();
-            const auto &caProvider = caProviders.DefaultValue();
-
-            const auto &clientId = caProvider.ClientId(SERVICE_APPLICATION_NAME);
-            const auto &clientSecret = caProvider.Secret(SERVICE_APPLICATION_NAME);
-
-            CStringList SQL;
-
-            api::login(SQL, clientId, clientSecret, m_Agent, m_Host);
-            api::get_sessions(SQL, API_BOT_USERNAME, m_Agent, m_Host);
-
-            try {
-                ExecSQL(SQL, nullptr, OnExecuted, OnException);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::SignOut(const CString &Session) {
-            CStringList SQL;
-
-            api::signout(SQL, Session);
-
-            try {
-                ExecSQL(SQL);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::EnumReportReady(const CString &Session, const CPQueryResult &List) {
-            int index;
-            CString Error;
-
-            for (int row = 0; row < List.Count(); ++row) {
-                const auto &rec = List[row];
-
-                const auto &id = rec["id"];
-                const auto &state_code = rec["statecode"];
-
-                index = m_Reports.IndexOf(id);
-                if (index != -1) {
-                    if (state_code == "canceled") {
-                        auto pQuery = dynamic_cast<CPQQuery *> (m_Reports.Objects(index));
-                        if (pQuery != nullptr) {
-                            if (pQuery->CancelQuery(Error)) {
-                                DoAbort(Session, id);
-                            } else {
-                                DoFail(Session, id, Error);
-                            }
-                        }
-                    }
-                } else {
-                    if (state_code == "progress") {
-                        DoStart(Session, id);
-                    }
-                }
-            }
-        }
-
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::CheckReportReady() {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-
-                CPQueryResults pqResults;
-                CStringList SQL;
-
-                const auto &session = APollQuery->Data()["session"];
-
-                try {
-                    CApostolModule::QueryToResults(APollQuery, pqResults);
-
-                    const auto &authorize = pqResults[QUERY_INDEX_AUTH].First();
-
-                    if (authorize["authorized"] != "t")
-                        throw Delphi::Exception::ExceptionFrm("Authorization failed: %s", authorize["message"].c_str());
-
-                    EnumReportReady(session, pqResults[QUERY_INDEX_DATA]);
-                } catch (Delphi::Exception::Exception &E) {
-                    DoFatal(E);
-                }
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            };
-
-            for (int i = 0; i < m_Sessions.Count(); ++i) {
-                const auto &session = m_Sessions[i];
-
-                CStringList SQL;
-
-                api::authorize(SQL, session);
-                api::report_ready(SQL, "enabled");
-
-                try {
-                    auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                    pQuery->Data().AddPair("session", session);
-                } catch (Delphi::Exception::Exception &E) {
-                    DoFatal(E);
-                }
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        int CReportServer::IndexOfReports(const CString &Id) {
-            return m_Reports.IndexOf(Id);
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        int CReportServer::AddReport(const CString &Id) {
-            const auto index = IndexOfReports(Id);
-            if (index == -1)
-                return m_Reports.Add(Id);
-            return index;
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        int CReportServer::DeleteReport(const CString &Id) {
-            const auto index = IndexOfReports(Id);
-            if (index != -1)
-                m_Reports.Delete(index);
-            return index;
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::DoStart(const CString &Session, const CString &Id) {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-
-                const auto &session = APollQuery->Data()["session"];
-                const auto &id = APollQuery->Data()["id"];
-
-                CPQResult *pResult;
-                try {
-                    for (int i = 0; i < APollQuery->Count(); i++) {
-                        pResult = APollQuery->Results(i);
-
-                        if (pResult->ExecStatus() != PGRES_TUPLES_OK)
-                            throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
-                    }
-                } catch (Delphi::Exception::Exception &E) {
-                    DeleteReport(id);
-                    DoError(E);
-                }
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteReport(id);
-                DoFatal(E);
-            };
-
-            CStringList SQL;
-
-            api::authorize(SQL, Session);
-            api::execute_report_ready(SQL, Id);
-
-            Log()->Message("[%s] Report started.", Id.c_str());
-
-            try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-
-                pQuery->Data().AddPair("session", Session);
-                pQuery->Data().AddPair("id", Id);
-
-                m_Reports.AddObject(Id, (CPQQuery *) pQuery);
-            } catch (Delphi::Exception::Exception &E) {
-                DeleteReport(Id);
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::DoComplete(const CString &Session, const CString &Id) {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteReport(id);
-                Log()->Message("[%s] Report completed.", id.c_str());
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteReport(id);
-                DoError(E);
-            };
-
-            CStringList SQL;
-
-            api::authorize(SQL, Session);
-            api::execute_object_action(SQL, Id, "complete");
-
-            try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().AddPair("id", Id);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::DoAbort(const CString &Session, const CString &Id) {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteReport(id);
-                Log()->Message("[%s] Report aborted.", id.c_str());
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteReport(id);
-                DoError(E);
-            };
-
-            CStringList SQL;
-
-            api::authorize(SQL, Session);
-            api::execute_object_action(SQL, Id, "abort");
-
-            try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().AddPair("id", Id);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::DoCancel(const CString &Session, const CString &Id) {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteReport(id);
-                Log()->Message("[%s] Report canceled.", id.c_str());
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteReport(id);
-                DoError(E);
-            };
-
-            CStringList SQL;
-
-            api::authorize(SQL, Session);
-            api::execute_object_action(SQL, Id, "cancel");
-
-            try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().AddPair("id", Id);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::DoFail(const CString &Session, const CString &Id, const CString &Error) {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteReport(id);
-                Log()->Message("[%s] Report failed.", id.c_str());
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                const auto &id = APollQuery->Data()["id"];
-                DeleteReport(id);
-                DoError(E);
-            };
-
-            CStringList SQL;
-
-            api::authorize(SQL, Session);
-            api::execute_object_action(SQL, Id, "fail");
-            api::set_object_label(SQL, Id, Error);
-
-            try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
-                pQuery->Data().AddPair("id", Id);
-            } catch (Delphi::Exception::Exception &E) {
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::DoFatal(const Delphi::Exception::Exception &E) {
-            DoError(E);
-
-            m_AuthDate = Now() + (CDateTime) SLEEP_SECOND_AFTER_ERROR / SecsPerDay; // 10 sec;
-            m_CheckDate = m_AuthDate;
-
-            m_Status = Process::psStopped;
-
-            Log()->Notice("[%s] Continue after %d seconds", ModuleName().c_str(), SLEEP_SECOND_AFTER_ERROR);
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::DoError(const Delphi::Exception::Exception &E) {
-            Log()->Error(APP_LOG_ERR, 0, "[%s] %s", ModuleName().c_str(), E.what());
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::DoReport(CQueueHandler *AHandler) {
-
-            auto OnExecuted = [this](CPQPollQuery *APollQuery) {
-
-                CPQueryResults pqResults;
-                CStringList SQL;
-
-                auto pHandler = dynamic_cast<CReportHandler *> (APollQuery->Binding());
-
-                if (pHandler == nullptr) {
-                    return;
-                }
-
-                try {
-                    CApostolModule::QueryToResults(APollQuery, pqResults);
-                    const auto &caReports = pqResults[QUERY_INDEX_DATA];
-                    if (caReports.Count() > 0) {
-                        EnumReportReady(pHandler->Session(), caReports);
-                    }
-                } catch (Delphi::Exception::Exception &E) {
-                    Log()->Error(APP_LOG_ERR, 0, "%s", E.what());
-                }
-
-                DeleteHandler(pHandler);
-            };
-
-            auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                auto pHandler = dynamic_cast<CReportHandler *> (APollQuery->Binding());
-                DeleteHandler(pHandler);
-                DoFatal(E);
-            };
-
-            auto pHandler = dynamic_cast<CReportHandler *> (AHandler);
-
-            if (IndexOfReports(pHandler->ReportId()) >= 0) {
-                Log()->Error(APP_LOG_WARN, 0, "[%s] [%s] Report already in progress.", ModuleName().c_str(), pHandler->ReportId().c_str());
-                DeleteHandler(AHandler);
+    }
+}
+
+// --- do_check ----------------------------------------------------------------
+//
+// Verify a single report (from NOTIFY) before starting:
+//   api.authorize(session) + api.get_report_ready(id)
+//   If statecode == "progress" -> do_start
+//
+
+void ReportServer::do_check(const std::string& id)
+{
+    if (!bot_->valid())
+        return;
+
+    auto sql = fmt::format(
+        "SELECT * FROM api.authorize({});\n"
+        "SELECT id, statecode FROM api.get_report_ready({}::uuid)",
+        pq_quote_literal(bot_->session()),
+        pq_quote_literal(id));
+
+    pool_->execute(sql,
+        [this, id](std::vector<PgResult> results) {
+            if (results.size() < 2 || !results[1].ok())
                 return;
-            }
 
-            CStringList SQL;
+            auto& res = results[1];
+            if (res.rows() == 0)
+                return;
 
-            api::authorize(SQL, pHandler->Session());
-            api::get_report_ready(SQL, pHandler->ReportId());
+            int col_statecode = res.column_index("statecode");
+            if (col_statecode < 0)
+                return;
 
-            try {
-                ExecSQL(SQL, AHandler, OnExecuted, OnException);
-                AHandler->Allow(false);
-                IncProgress();
-            } catch (Delphi::Exception::Exception &E) {
-                DeleteHandler(AHandler);
-                DoFatal(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
+            std::string state = res.value(0, col_statecode)
+                                    ? res.value(0, col_statecode) : "";
+            if (state == "progress" && !in_progress(id))
+                do_start(id);
+        },
+        [this](std::string_view error) {
+            on_fatal(std::string(error));
+        });
+}
 
-        void CReportServer::DoPostgresNotify(CPQConnection *AConnection, PGnotify *ANotify) {
-            DebugNotify(AConnection, ANotify);
+// --- do_start ----------------------------------------------------------------
+//
+// Execute the report:
+//   api.authorize(session) + api.execute_report_ready(id)
+//
 
-            if (CompareString(ANotify->relname, PG_LISTEN_NAME) == 0) {
-#if defined(_GLIBCXX_RELEASE) && (_GLIBCXX_RELEASE >= 9)
-                new CReportHandler(this, ANotify->extra, [this](auto &&Handler) { DoReport(Handler); });
-#else
-                new CReportHandler(this, ANotify->extra, std::bind(&CReportServer::DoReport, this, _1));
-#endif
-                UnloadQueue();
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
+void ReportServer::do_start(const std::string& id)
+{
+    reports_[id] = Report{id, std::chrono::system_clock::now()};
 
-        void CReportServer::DoPostgresQueryExecuted(CPQPollQuery *APollQuery) {
-            CPQResult *pResult;
+    logger_->debug("ReportServer: starting report {}", id);
 
-            try {
-                for (int i = 0; i < APollQuery->Count(); i++) {
-                    pResult = APollQuery->Results(i);
-                    if (pResult->ExecStatus() != PGRES_TUPLES_OK)
-                        throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
-                }
-            } catch (Delphi::Exception::Exception &E) {
-                DoError(E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::DoPostgresQueryException(CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-            DoFatal(E);
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::UnloadQueue() {
-            const auto index = m_Queue.IndexOf(this);
-            if (index != -1) {
-                const auto queue = m_Queue[index];
-                for (int i = 0; i < queue->Count(); ++i) {
-                    auto pHandler = (CReportHandler *) queue->Item(i);
-                    if (pHandler != nullptr) {
-                        pHandler->Handler();
-                        if (m_Progress >= m_MaxQueue)
-                            break;
-                    }
-                }
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::Heartbeat(CDateTime Now) {
-            if ((Now >= m_AuthDate)) {
-                m_AuthDate = Now + (CDateTime) 5 / SecsPerDay; // 5 sec
-                Authentication();
-            }
-
-            if (m_Status == Process::psRunning) {
-                UnloadQueue();
-                if ((Now >= m_CheckDate)) {
-                    m_CheckDate = Now + (CDateTime) 1 / MinsPerDay; // 1 min
-                    CheckListen();
-                    if (m_Queue.IndexOf(this) == -1) {
-                        CheckReportReady();
-                    }
-                }
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportServer::Reload() {
-            m_AuthDate = 0;
-            m_CheckDate = 0;
-
-            m_Status = Process::psStopped;
-
-            Log()->Notice("[%s] Reloading...", ModuleName().c_str());
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        bool CReportServer::Enabled() {
-            if (m_ModuleStatus == msUnknown)
-                m_ModuleStatus = Config()->IniFile().ReadBool(SectionName().c_str(), "enable", true) ? msEnabled : msDisabled;
-            return m_ModuleStatus == msEnabled;
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        bool CReportServer::CheckLocation(const CLocation &Location) {
-            return false;
-        }
+    if (!bot_->valid()) {
+        delete_report(id);
+        return;
     }
+
+    auto sql = fmt::format(
+        "SELECT * FROM api.authorize({});\n"
+        "SELECT * FROM api.execute_report_ready({}::uuid)",
+        pq_quote_literal(bot_->session()),
+        pq_quote_literal(id));
+
+    pool_->execute(sql,
+        [this, id](std::vector<PgResult> /*results*/) {
+            if (in_progress(id))
+                do_complete(id);
+        },
+        [this, id](std::string_view error) {
+            if (in_progress(id))
+                do_fail(id, std::string(error));
+            else
+                delete_report(id);
+        });
 }
+
+// --- do_complete -------------------------------------------------------------
+
+void ReportServer::do_complete(const std::string& id)
+{
+    logger_->debug("ReportServer: report {} complete", id);
+
+    execute_action(id, "complete",
+        [this, id](std::vector<PgResult> /*results*/) {
+            delete_report(id);
+        });
 }
+
+// --- do_abort ----------------------------------------------------------------
+
+void ReportServer::do_abort(const std::string& id)
+{
+    logger_->notice("ReportServer: aborting report {}", id);
+
+    execute_action(id, "abort",
+        [this, id](std::vector<PgResult> /*results*/) {
+            delete_report(id);
+        });
+}
+
+// --- do_fail -----------------------------------------------------------------
+//
+// Mark report as failed + store error as object label.
+//
+
+void ReportServer::do_fail(const std::string& id, const std::string& error)
+{
+    logger_->error("ReportServer: report {} failed: {}", id, error);
+
+    if (!bot_->valid()) {
+        delete_report(id);
+        return;
+    }
+
+    auto sql = fmt::format(
+        "SELECT * FROM api.authorize({});\n"
+        "SELECT * FROM api.execute_object_action({}::uuid, {});\n"
+        "SELECT * FROM api.set_object_label({}::uuid, {})",
+        pq_quote_literal(bot_->session()),
+        pq_quote_literal(id), pq_quote_literal("fail"),
+        pq_quote_literal(id), pq_quote_literal(error));
+
+    pool_->execute(sql,
+        [this, id](std::vector<PgResult> /*results*/) {
+            delete_report(id);
+        },
+        [this, id](std::string_view err) {
+            logger_->error("ReportServer: do_fail SQL error for {}: {}", id, err);
+            delete_report(id);
+        });
+}
+
+// --- execute_action ----------------------------------------------------------
+//
+// Helper: api.authorize(session) + api.execute_object_action(id, action)
+//
+
+void ReportServer::execute_action(const std::string& id, std::string_view action,
+                                  PgQuery::ResultHandler on_result)
+{
+    if (!bot_->valid()) {
+        delete_report(id);
+        return;
+    }
+
+    auto sql = fmt::format(
+        "SELECT * FROM api.authorize({});\n"
+        "SELECT * FROM api.execute_object_action({}::uuid, {})",
+        pq_quote_literal(bot_->session()),
+        pq_quote_literal(id),
+        pq_quote_literal(action));
+
+    pool_->execute(sql, std::move(on_result),
+        [this, id, act = std::string(action)](std::string_view error) {
+            logger_->error("ReportServer: action '{}' failed for {}: {}", act, id, error);
+            delete_report(id);
+            on_fatal(std::string(error));
+        });
+}
+
+// --- delete_report / in_progress ---------------------------------------------
+
+void ReportServer::delete_report(const std::string& id)
+{
+    reports_.erase(id);
+}
+
+bool ReportServer::in_progress(const std::string& id) const
+{
+    return reports_.count(id) > 0;
+}
+
+// --- on_fatal ----------------------------------------------------------------
+//
+// Catastrophic error -- pause for 10 seconds before retrying.
+//
+
+void ReportServer::on_fatal(const std::string& error)
+{
+    status_ = Status::stopped;
+    next_check_ = std::chrono::system_clock::now() + std::chrono::seconds(10);
+    logger_->error("ReportServer: fatal error, pausing 10s: {}", error);
+}
+
+} // namespace apostol
+
+#endif // WITH_POSTGRESQL
