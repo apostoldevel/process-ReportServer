@@ -3,12 +3,12 @@
 Report Server
 -
 
-**Process** for [Apostol](https://github.com/apostoldevel/apostol) + [db-platform](https://github.com/apostoldevel/db-platform) — **Apostol CRM**[^crm].
+**Process** for **Apostol CRM**[^crm].
 
 Description
 -
 
-**Report Server** is a background process module for the [Apostol](https://github.com/apostoldevel/apostol) framework. It runs as an independent forked process and executes pre-defined database reports asynchronously. A report is a PL/pgSQL routine registered in the report queue; the process picks it up, runs it as a PostgreSQL query, and updates the report's state when done.
+**Report Server** is a background process module for the [Апостол (C++20)](https://github.com/apostoldevel/libapostol) framework. It runs as an independent forked process and executes pre-defined database reports asynchronously. A report is a PL/pgSQL routine registered in the report queue; the process picks it up, runs it as a PostgreSQL query, and updates the report's state when done.
 
 Key characteristics:
 
@@ -126,6 +126,6 @@ The process also requires:
 Installation
 -
 
-Follow the build and installation instructions for [Apostol](https://github.com/apostoldevel/apostol#building-and-installation).
+Follow the build and installation instructions for [Апостол (C++20)](https://github.com/apostoldevel/libapostol#build-and-installation).
 
-[^crm]: **Apostol CRM** is an abstract term, not a standalone product. It refers to any project that uses both the [Apostol](https://github.com/apostoldevel/apostol) C++ framework and [db-platform](https://github.com/apostoldevel/db-platform) together through purpose-built modules and processes. Each framework can be used independently; combined, they form a full-stack backend platform.
+[^crm]: **Apostol CRM** — шаблон-проект построенный на фреймворках [A-POST-OL](https://github.com/apostoldevel/libapostol) (C++20) и [PostgreSQL Framework for Backend Development](https://github.com/apostoldevel/db-platform).
