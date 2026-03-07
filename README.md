@@ -17,6 +17,10 @@ Key characteristics:
 * Authenticates via OAuth2 `client_credentials` grant using `BotSession` — re-authenticates every 24 hours.
 * **NOTIFY-driven**: subscribes to PostgreSQL `LISTEN report` channel for immediate dispatch.
 * **Polling fallback**: checks `api.report_ready('enabled')` every minute to catch missed notifications.
+* **Concurrency control**: `max_in_flight` parameter bounds the number of reports being executed simultaneously.
+* **Stale report cleanup**: reports stuck in-flight longer than `report_timeout` are automatically removed.
+* **Bounded NOTIFY queue**: incoming notifications are capped at `max_pending` to prevent unbounded memory growth.
+* **PQcancel support**: canceled reports trigger `PQcancel` to stop running SQL queries immediately.
 * Handles error recovery: failed reports are marked with the error message; the server pauses for 10 seconds on fatal errors.
 
 ### Architecture
@@ -46,7 +50,7 @@ heartbeat (1s)
                           for each report:
                             progress && !in_progress → do_start(id)
                               └── api.execute_report_ready(id)
-                              └── success → do_complete() → action 'complete'
+                              └── rpc_* routines handle completion internally
                               └── error   → do_fail()  → action 'fail' + set_object_label
                             canceled && in_progress → do_abort(id)
                               └── api.execute_object_action(id, 'abort')
@@ -108,7 +112,10 @@ In the application config (`conf/apostol.json`):
   "module": {
     "ReportServer": {
       "enable": true,
-      "heartbeat": 60000
+      "heartbeat": 60000,
+      "max_in_flight": 5,
+      "report_timeout": 300000,
+      "max_pending": 1000
     }
   }
 }
@@ -118,6 +125,9 @@ In the application config (`conf/apostol.json`):
 |-----------|------|---------|-------------|
 | `enable` | bool | `false` | Enable/disable the process |
 | `heartbeat` | int | `60000` | Report check interval in milliseconds |
+| `max_in_flight` | int | `5` | Maximum concurrent report executions |
+| `report_timeout` | int | `300000` | Stale report timeout in milliseconds (5 min). In-flight reports exceeding this age are removed to free concurrency slots. |
+| `max_pending` | int | `1000` | Maximum NOTIFY queue size. Notifications arriving when the queue is full are dropped (recovered by polling fallback). |
 
 The process also requires:
 * `postgres.helper` connection string in the config (used for the `apibot` connection pool)

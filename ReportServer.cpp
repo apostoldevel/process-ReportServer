@@ -31,14 +31,20 @@ void ReportServer::on_start(EventLoop& /*loop*/, Application& app)
         on_notify(payload);
     });
 
-    // Read heartbeat interval from config
+    // Read config
     if (auto* cfg = app.module_config("ReportServer")) {
         if (cfg->contains("heartbeat") && (*cfg)["heartbeat"].is_number())
             check_interval_ = milliseconds((*cfg)["heartbeat"].get<int>());
+        if (cfg->contains("report_timeout") && (*cfg)["report_timeout"].is_number())
+            report_timeout_ = milliseconds((*cfg)["report_timeout"].get<int>());
+        if (cfg->contains("max_in_flight") && (*cfg)["max_in_flight"].is_number())
+            max_in_flight_ = (*cfg)["max_in_flight"].get<std::size_t>();
+        if (cfg->contains("max_pending") && (*cfg)["max_pending"].is_number())
+            max_pending_ = (*cfg)["max_pending"].get<std::size_t>();
     }
 
-    logger_->notice("ReportServer started (check_interval={}ms)",
-                    check_interval_.count());
+    logger_->notice("ReportServer started (check_interval={}ms, max_in_flight={}, max_pending={})",
+                    check_interval_.count(), max_in_flight_, max_pending_);
 }
 
 // --- heartbeat ---------------------------------------------------------------
@@ -62,6 +68,18 @@ void ReportServer::heartbeat(std::chrono::system_clock::time_point now)
     if (now >= next_check_) {
         check_reports();
         next_check_ = now + check_interval_;
+    }
+
+    // Sweep stale reports (stuck in-flight longer than report_timeout_)
+    for (auto it = reports_.begin(); it != reports_.end(); ) {
+        auto age = std::chrono::duration_cast<milliseconds>(now - it->second.started_at);
+        if (age > report_timeout_) {
+            logger_->warn("ReportServer: report {} timed out after {}ms, removing",
+                         it->first, age.count());
+            it = reports_.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
@@ -88,7 +106,7 @@ void ReportServer::on_notify(std::string_view payload)
         auto j = nlohmann::json::parse(payload);
         if (j.contains("id") && j["id"].is_string()) {
             auto id = j["id"].get<std::string>();
-            if (!id.empty() && !in_progress(id))
+            if (!id.empty() && !in_progress(id) && pending_reports_.size() < max_pending_)
                 pending_reports_.push_back(std::move(id));
         }
     } catch (const nlohmann::json::exception& e) {
@@ -109,6 +127,8 @@ void ReportServer::process_notify_queue()
     pending_reports_.clear();
 
     for (auto& id : pending) {
+        if (reports_.size() >= max_in_flight_)
+            break;
         if (!in_progress(id))
             do_check(id);
     }
@@ -175,7 +195,7 @@ void ReportServer::enum_reports(std::vector<PgResult> results)
             if (state == "canceled")
                 do_abort(id);
         } else {
-            if (state == "progress")
+            if (state == "progress" && reports_.size() < max_in_flight_)
                 do_start(id);
         }
     }
@@ -245,10 +265,11 @@ void ReportServer::do_start(const std::string& id)
         pq_quote_literal(bot_->session()),
         pq_quote_literal(id));
 
-    pool_->execute(sql,
+    auto qid = pool_->execute(sql,
         [this, id](std::vector<PgResult> /*results*/) {
-            if (in_progress(id))
-                do_complete(id);
+            // rpc_* routines handle state transitions themselves
+            // (sync: DoAction 'complete', async: callback completes later)
+            delete_report(id);
         },
         [this, id](std::string_view error) {
             if (in_progress(id))
@@ -256,6 +277,11 @@ void ReportServer::do_start(const std::string& id)
             else
                 delete_report(id);
         });
+
+    // Store query handle for cancel support
+    auto it = reports_.find(id);
+    if (it != reports_.end())
+        it->second.query_id = qid;
 }
 
 // --- do_complete -------------------------------------------------------------
@@ -276,9 +302,17 @@ void ReportServer::do_abort(const std::string& id)
 {
     logger_->notice("ReportServer: aborting report {}", id);
 
+    // Cancel running SQL body if any (PQcancel → PostgreSQL)
+    auto it = reports_.find(id);
+    if (it != reports_.end() && it->second.query_id != 0)
+        pool_->cancel(it->second.query_id);
+
+    // Remove from tracking immediately — canceled query results will be discarded
+    delete_report(id);
+
     execute_action(id, "abort",
-        [this, id](std::vector<PgResult> /*results*/) {
-            delete_report(id);
+        [](std::vector<PgResult> /*results*/) {
+            // report already removed from reports_
         });
 }
 

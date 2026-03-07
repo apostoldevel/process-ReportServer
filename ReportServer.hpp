@@ -72,14 +72,22 @@ private:
     enum class Status { stopped, running };
     Status status_{Status::stopped};
 
-    struct Report { std::string id; time_point started_at; };
+    struct Report {
+        std::string id;
+        time_point  started_at;
+        uint64_t    query_id{0};  // PgPool query handle for cancel
+    };
+
     std::unordered_map<std::string, Report> reports_;
 
     // Pending report IDs from NOTIFY (processed in heartbeat)
     std::vector<std::string> pending_reports_;
 
     time_point   next_check_{};
-    milliseconds check_interval_{60'000};  // 1 minute
+    milliseconds check_interval_{60'000};   // 1 minute
+    milliseconds report_timeout_{300'000};  // 5 minutes — stale report cleanup
+    std::size_t  max_in_flight_{5};
+    std::size_t  max_pending_{1000};
 
     // -- NOTIFY ---------------------------------------------------------------
     void on_notify(std::string_view payload);
