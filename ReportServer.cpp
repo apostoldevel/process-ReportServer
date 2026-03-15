@@ -126,11 +126,15 @@ void ReportServer::process_notify_queue()
     auto pending = std::move(pending_reports_);
     pending_reports_.clear();
 
-    for (auto& id : pending) {
-        if (reports_.size() >= max_in_flight_)
+    for (std::size_t i = 0; i < pending.size(); ++i) {
+        if (reports_.size() >= max_in_flight_) {
+            // Put unprocessed IDs back for the next heartbeat cycle
+            for (; i < pending.size(); ++i)
+                pending_reports_.push_back(std::move(pending[i]));
             break;
-        if (!in_progress(id))
-            do_check(id);
+        }
+        if (!in_progress(pending[i]))
+            do_check(pending[i]);
     }
 }
 
