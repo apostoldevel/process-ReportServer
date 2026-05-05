@@ -120,7 +120,7 @@ namespace Apostol {
                     auto pResult = APollQuery->Results(0);
 
                     if (pResult->ExecStatus() != PGRES_COMMAND_OK) {
-                        throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
+                        throw Delphi::Exception::EDBError("%s", pResult->GetErrorMessage());
                     }
 
                     APollQuery->Connection()->Listeners().Add(PG_LISTEN_NAME);
@@ -333,7 +333,7 @@ namespace Apostol {
                         pResult = APollQuery->Results(i);
 
                         if (pResult->ExecStatus() != PGRES_TUPLES_OK)
-                            throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
+                            throw Delphi::Exception::EDBError("%s", pResult->GetErrorMessage());
                     }
                 } catch (Delphi::Exception::Exception &E) {
                     DeleteReport(id);
@@ -575,7 +575,7 @@ namespace Apostol {
                 for (int i = 0; i < APollQuery->Count(); i++) {
                     pResult = APollQuery->Results(i);
                     if (pResult->ExecStatus() != PGRES_TUPLES_OK)
-                        throw Delphi::Exception::EDBError(pResult->GetErrorMessage());
+                        throw Delphi::Exception::EDBError("%s", pResult->GetErrorMessage());
                 }
             } catch (Delphi::Exception::Exception &E) {
                 DoError(E);
