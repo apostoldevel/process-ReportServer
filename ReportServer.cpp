@@ -117,7 +117,7 @@ namespace Apostol {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
                 try {
-                    auto pResult = APollQuery->Results(0);
+                    const auto pResult = APollQuery->Results(0);
 
                     if (pResult->ExecStatus() != PGRES_COMMAND_OK) {
                         throw Delphi::Exception::EDBError("%s", pResult->GetErrorMessage());
@@ -160,11 +160,11 @@ namespace Apostol {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
-                CPQueryResults pqResults;
-
                 CStringList SQL;
 
                 try {
+                    CPQueryResults pqResults;
+
                     CApostolModule::QueryToResults(APollQuery, pqResults);
 
                     const auto &login = pqResults[0];
@@ -223,7 +223,6 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CReportServer::EnumReportReady(const CString &Session, const CPQueryResult &List) {
-            int index;
             CString Error;
 
             for (int row = 0; row < List.Count(); ++row) {
@@ -232,10 +231,10 @@ namespace Apostol {
                 const auto &id = rec["id"];
                 const auto &state_code = rec["statecode"];
 
-                index = m_Reports.IndexOf(id);
+                const auto index = m_Reports.IndexOf(id);
                 if (index != -1) {
                     if (state_code == "canceled") {
-                        auto pQuery = dynamic_cast<CPQQuery *> (m_Reports.Objects(index));
+                        const auto pQuery = dynamic_cast<CPQQuery *> (m_Reports.Objects(index));
                         if (pQuery != nullptr) {
                             if (pQuery->CancelQuery(Error)) {
                                 DoAbort(Session, id);
@@ -258,12 +257,13 @@ namespace Apostol {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
-                CPQueryResults pqResults;
                 CStringList SQL;
 
                 const auto &session = APollQuery->Data()["session"];
 
                 try {
+                    CPQueryResults pqResults;
+
                     CApostolModule::QueryToResults(APollQuery, pqResults);
 
                     const auto &authorize = pqResults[QUERY_INDEX_AUTH].First();
@@ -290,7 +290,7 @@ namespace Apostol {
                 api::report_ready(SQL, "enabled");
 
                 try {
-                    auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                    const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
                     pQuery->Data().AddPair("session", session);
                 } catch (Delphi::Exception::Exception &E) {
                     DoFatal(E);
@@ -327,10 +327,9 @@ namespace Apostol {
                 const auto &session = APollQuery->Data()["session"];
                 const auto &id = APollQuery->Data()["id"];
 
-                CPQResult *pResult;
                 try {
                     for (int i = 0; i < APollQuery->Count(); i++) {
-                        pResult = APollQuery->Results(i);
+                        const auto pResult = APollQuery->Results(i);
 
                         if (pResult->ExecStatus() != PGRES_TUPLES_OK)
                             throw Delphi::Exception::EDBError("%s", pResult->GetErrorMessage());
@@ -355,7 +354,7 @@ namespace Apostol {
             Log()->Message("[%s] Report started.", Id.c_str());
 
             try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
 
                 pQuery->Data().AddPair("session", Session);
                 pQuery->Data().AddPair("id", Id);
@@ -388,7 +387,7 @@ namespace Apostol {
             api::execute_object_action(SQL, Id, "complete");
 
             try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
                 pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
@@ -416,7 +415,7 @@ namespace Apostol {
             api::execute_object_action(SQL, Id, "abort");
 
             try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
                 pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
@@ -444,7 +443,7 @@ namespace Apostol {
             api::execute_object_action(SQL, Id, "cancel");
 
             try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
                 pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
@@ -473,7 +472,7 @@ namespace Apostol {
             api::set_object_label(SQL, Id, Error);
 
             try {
-                auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
+                const auto pQuery = ExecSQL(SQL, nullptr, OnExecuted, OnException);
                 pQuery->Data().AddPair("id", Id);
             } catch (Delphi::Exception::Exception &E) {
                 DoFatal(E);
@@ -502,16 +501,17 @@ namespace Apostol {
 
             auto OnExecuted = [this](CPQPollQuery *APollQuery) {
 
-                CPQueryResults pqResults;
                 CStringList SQL;
 
-                auto pHandler = dynamic_cast<CReportHandler *> (APollQuery->Binding());
+                const auto pHandler = dynamic_cast<CReportHandler *> (APollQuery->Binding());
 
                 if (pHandler == nullptr) {
                     return;
                 }
 
                 try {
+                    CPQueryResults pqResults;
+
                     CApostolModule::QueryToResults(APollQuery, pqResults);
                     const auto &caReports = pqResults[QUERY_INDEX_DATA];
                     if (caReports.Count() > 0) {
@@ -525,12 +525,12 @@ namespace Apostol {
             };
 
             auto OnException = [this](CPQPollQuery *APollQuery, const Delphi::Exception::Exception &E) {
-                auto pHandler = dynamic_cast<CReportHandler *> (APollQuery->Binding());
+                const auto pHandler = dynamic_cast<CReportHandler *> (APollQuery->Binding());
                 DeleteHandler(pHandler);
                 DoFatal(E);
             };
 
-            auto pHandler = dynamic_cast<CReportHandler *> (AHandler);
+            const auto pHandler = dynamic_cast<CReportHandler *> (AHandler);
 
             if (IndexOfReports(pHandler->ReportId()) >= 0) {
                 Log()->Error(APP_LOG_WARN, 0, "[%s] [%s] Report already in progress.", ModuleName().c_str(), pHandler->ReportId().c_str());
@@ -569,11 +569,9 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CReportServer::DoPostgresQueryExecuted(CPQPollQuery *APollQuery) {
-            CPQResult *pResult;
-
             try {
                 for (int i = 0; i < APollQuery->Count(); i++) {
-                    pResult = APollQuery->Results(i);
+                    const auto pResult = APollQuery->Results(i);
                     if (pResult->ExecStatus() != PGRES_TUPLES_OK)
                         throw Delphi::Exception::EDBError("%s", pResult->GetErrorMessage());
                 }
@@ -593,7 +591,7 @@ namespace Apostol {
             if (index != -1) {
                 const auto queue = m_Queue[index];
                 for (int i = 0; i < queue->Count(); ++i) {
-                    auto pHandler = (CReportHandler *) queue->Item(i);
+                    const auto pHandler = (CReportHandler *) queue->Item(i);
                     if (pHandler != nullptr) {
                         pHandler->Handler();
                         if (m_Progress >= m_MaxQueue)
@@ -605,14 +603,14 @@ namespace Apostol {
         //--------------------------------------------------------------------------------------------------------------
 
         void CReportServer::Heartbeat(CDateTime Now) {
-            if ((Now >= m_AuthDate)) {
+            if (Now >= m_AuthDate) {
                 m_AuthDate = Now + (CDateTime) 5 / SecsPerDay; // 5 sec
                 Authentication();
             }
 
             if (m_Status == Process::psRunning) {
                 UnloadQueue();
-                if ((Now >= m_CheckDate)) {
+                if (Now >= m_CheckDate) {
                     m_CheckDate = Now + (CDateTime) 1 / MinsPerDay; // 1 min
                     CheckListen();
                     if (m_Queue.IndexOf(this) == -1) {
