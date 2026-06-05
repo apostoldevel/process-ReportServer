@@ -93,7 +93,7 @@ namespace Apostol {
 
         //--------------------------------------------------------------------------------------------------------------
 
-        CReportServer::CReportServer(CModuleProcess *AProcess): CQueueCollection(Config()->PostgresPollMin()),
+        CReportServer::CReportServer(CModuleProcess *AProcess): CQueueCollection(Config()->PostgresPollMax()),
                 CApostolModule(AProcess, "report server", "module/ReportServer") {
 
             m_Agent = CString().Format("%s (%s)", GApplication->Title().c_str(), ModuleName().c_str());

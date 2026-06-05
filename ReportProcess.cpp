@@ -42,7 +42,6 @@ namespace Apostol {
         CReportProcess::CReportProcess(CCustomProcess *AParent, CApplication *AApplication):
                 inherited(AParent, AApplication, ptCustom, "report server") {
 
-            m_MaxMessagesQueue = Config()->PostgresPollMin();
         }
         //--------------------------------------------------------------------------------------------------------------
 
@@ -57,7 +56,7 @@ namespace Apostol {
 
             SetUser(Config()->User(), Config()->Group());
 
-            InitializePQClients(Application()->Title(), 1, m_MaxMessagesQueue);
+            InitializePQClients(Application()->Title());
 
             SigProcMask(SIG_UNBLOCK);
 
@@ -121,26 +120,6 @@ namespace Apostol {
         void CReportProcess::Reload() {
             CServerProcess::Reload();
             m_Report.Reload();
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportProcess::DoTimer(CPollEventHandler *AHandler) {
-            uint64_t exp;
-
-            auto pTimer = dynamic_cast<CEPollTimer *> (AHandler->Binding());
-            pTimer->Read(&exp, sizeof(uint64_t));
-
-            try {
-                DoHeartbeat(AHandler->TimeStamp());
-                CModuleProcess::HeartbeatModules(AHandler->TimeStamp());
-            } catch (Delphi::Exception::Exception &E) {
-                DoServerEventHandlerException(AHandler, E);
-            }
-        }
-        //--------------------------------------------------------------------------------------------------------------
-
-        void CReportProcess::DoHeartbeat(CDateTime Datetime) {
-
         }
         //--------------------------------------------------------------------------------------------------------------
 

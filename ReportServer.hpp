@@ -77,8 +77,6 @@ namespace Apostol {
             CDateTime m_CheckDate;
             CDateTime m_AuthDate;
 
-            void InitMethods() override;
-
             void InitListen();
             void CheckListen();
 
@@ -93,6 +91,8 @@ namespace Apostol {
             void CheckReportReady();
 
         protected:
+
+            void InitMethods() override;
 
             void DoFatal(const Delphi::Exception::Exception &E);
             void DoError(const Delphi::Exception::Exception &E);
@@ -116,7 +116,7 @@ namespace Apostol {
 
             ~CReportServer() override = default;
 
-            static class CReportServer *CreateModule(CModuleProcess *AProcess) {
+            static CReportServer *CreateModule(CModuleProcess *AProcess) {
                 return new CReportServer(AProcess);
             }
 

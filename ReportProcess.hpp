@@ -47,16 +47,11 @@ namespace Apostol {
 
             CReportServer m_Report { this };
 
-            size_t m_MaxMessagesQueue;
+        protected:
 
             void BeforeRun() override;
             void AfterRun() override;
 
-            void DoHeartbeat(CDateTime Datetime);
-
-        protected:
-
-            void DoTimer(CPollEventHandler *AHandler) override;
             bool DoExecute(CTCPConnection *AConnection) override;
 
         public:
@@ -65,7 +60,7 @@ namespace Apostol {
 
             ~CReportProcess() override = default;
 
-            static class CReportProcess *CreateProcess(CCustomProcess *AParent, CApplication *AApplication) {
+            static CReportProcess *CreateProcess(CCustomProcess *AParent, CApplication *AApplication) {
                 return new CReportProcess(AParent, AApplication);
             }
 
