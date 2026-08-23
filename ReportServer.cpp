@@ -106,8 +106,17 @@ void ReportServer::on_notify(std::string_view payload)
         auto j = nlohmann::json::parse(payload);
         if (j.contains("id") && j["id"].is_string()) {
             auto id = j["id"].get<std::string>();
+
+            // The notification names the session it came from —
+            // pg_notify('report', json_build_object('session', current_session(), …)).
+            // Taking it saves guessing which scope the report lives in, and it is
+            // the requester's own session, so it authorizes into the right one.
+            auto session = j.contains("session") && j["session"].is_string()
+                               ? j["session"].get<std::string>()
+                               : std::string();
+
             if (!id.empty() && !in_progress(id) && pending_reports_.size() < max_pending_)
-                pending_reports_.push_back(std::move(id));
+                pending_reports_.push_back(Pending{std::move(id), std::move(session)});
         }
     } catch (const nlohmann::json::exception& e) {
         if (logger_)
@@ -133,8 +142,8 @@ void ReportServer::process_notify_queue()
                 pending_reports_.push_back(std::move(pending[i]));
             break;
         }
-        if (!in_progress(pending[i]))
-            do_check(pending[i]);
+        if (!in_progress(pending[i].id))
+            do_check(pending[i].session, pending[i].id);
     }
 }
 
@@ -150,19 +159,24 @@ void ReportServer::check_reports()
     if (!bot_->valid())
         return;
 
-    auto sql = fmt::format(
-        "SELECT * FROM api.authorize({});\n"
-        "SELECT * FROM api.report_ready('enabled') ORDER BY created",
-        pq_quote_literal(bot_->session()));
+    // One pass per scope: api.report_ready answers within the authorized session's
+    // scope, so a single pass under the first session leaves every other scope's
+    // reports unseen. v1 looped over api.get_sessions; the port kept one.
+    for (const auto& session : bot_->sessions()) {
+        auto sql = fmt::format(
+            "SELECT * FROM api.authorize({});\n"
+            "SELECT * FROM api.report_ready('enabled') ORDER BY created",
+            pq_quote_literal(session));
 
-    pool_->execute(sql,
-        [this](std::vector<PgResult> results) {
-            enum_reports(std::move(results));
-        },
-        [this](std::string_view error) {
-            on_fatal(std::string(error));
-        },
-        /*quiet=*/true);
+        pool_->execute(sql,
+            [this, session](std::vector<PgResult> results) {
+                enum_reports(session, std::move(results));
+            },
+            [this](std::string_view error) {
+                on_fatal(std::string(error));
+            },
+            /*quiet=*/true);
+    }
 }
 
 // --- enum_reports ------------------------------------------------------------
@@ -173,7 +187,7 @@ void ReportServer::check_reports()
 //     - state == "canceled" && in_progress  -> do_abort
 //
 
-void ReportServer::enum_reports(std::vector<PgResult> results)
+void ReportServer::enum_reports(const std::string& session, std::vector<PgResult> results)
 {
     // results[0] = authorize, results[1] = report_ready list
     if (results.size() < 2 || !results[1].ok())
@@ -200,7 +214,7 @@ void ReportServer::enum_reports(std::vector<PgResult> results)
                 do_abort(id);
         } else {
             if (state == "progress" && reports_.size() < max_in_flight_)
-                do_start(id);
+                do_start(session, id);
         }
     }
 }
@@ -212,19 +226,23 @@ void ReportServer::enum_reports(std::vector<PgResult> results)
 //   If statecode == "progress" -> do_start
 //
 
-void ReportServer::do_check(const std::string& id)
+void ReportServer::do_check(const std::string& session, const std::string& id)
 {
     if (!bot_->valid())
         return;
 
+    // The notification's own session when there is one, ours otherwise — a report
+    // found by polling was enumerated under one of ours.
+    const auto& use = session.empty() ? bot_->session() : session;
+
     auto sql = fmt::format(
         "SELECT * FROM api.authorize({});\n"
         "SELECT id, statecode FROM api.get_report_ready({}::uuid)",
-        pq_quote_literal(bot_->session()),
+        pq_quote_literal(use),
         pq_quote_literal(id));
 
     pool_->execute(sql,
-        [this, id](std::vector<PgResult> results) {
+        [this, id, use](std::vector<PgResult> results) {
             if (results.size() < 2 || !results[1].ok())
                 return;
 
@@ -239,7 +257,7 @@ void ReportServer::do_check(const std::string& id)
             std::string state = res.value(0, col_statecode)
                                     ? res.value(0, col_statecode) : "";
             if (state == "progress" && !in_progress(id))
-                do_start(id);
+                do_start(use, id);
         },
         [this](std::string_view error) {
             on_fatal(std::string(error));
@@ -252,9 +270,9 @@ void ReportServer::do_check(const std::string& id)
 //   api.authorize(session) + api.execute_report_ready(id)
 //
 
-void ReportServer::do_start(const std::string& id)
+void ReportServer::do_start(const std::string& session, const std::string& id)
 {
-    reports_[id] = Report{id, std::chrono::system_clock::now()};
+    reports_[id] = Report{id, session, std::chrono::system_clock::now()};
 
     logger_->debug("ReportServer: starting report {}", id);
 
@@ -266,7 +284,7 @@ void ReportServer::do_start(const std::string& id)
     auto sql = fmt::format(
         "SELECT * FROM api.authorize({});\n"
         "SELECT * FROM api.execute_report_ready({}::uuid)",
-        pq_quote_literal(bot_->session()),
+        pq_quote_literal(session),
         pq_quote_literal(id));
 
     auto qid = pool_->execute(sql,
@@ -338,7 +356,7 @@ void ReportServer::do_fail(const std::string& id, const std::string& error)
         "SELECT * FROM api.authorize({});\n"
         "SELECT * FROM api.execute_object_action({}::uuid, {});\n"
         "SELECT * FROM api.set_object_label({}::uuid, {})",
-        pq_quote_literal(bot_->session()),
+        pq_quote_literal(report_session(id)),
         pq_quote_literal(id), pq_quote_literal("fail"),
         pq_quote_literal(id), pq_quote_literal(error));
 
@@ -357,7 +375,7 @@ void ReportServer::do_fail(const std::string& id, const std::string& error)
 void ReportServer::execute_action(const std::string& id, std::string_view action,
                                   PgQuery::ResultHandler on_result)
 {
-    bot_->execute_action(id, action, std::move(on_result),
+    bot_->execute_action(report_session(id), id, action, std::move(on_result),
         [this, id, act = std::string(action)](std::string_view error) {
             logger_->error("ReportServer: action '{}' failed for {}: {}", act, id, error);
             delete_report(id);
@@ -366,6 +384,12 @@ void ReportServer::execute_action(const std::string& id, std::string_view action
 }
 
 // --- delete_report / in_progress ---------------------------------------------
+
+std::string ReportServer::report_session(const std::string& id) const
+{
+    auto it = reports_.find(id);
+    return it == reports_.end() ? bot_->session() : it->second.session;
+}
 
 void ReportServer::delete_report(const std::string& id)
 {

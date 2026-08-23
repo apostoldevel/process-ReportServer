@@ -74,14 +74,21 @@ private:
 
     struct Report {
         std::string id;
+        std::string session;      // the scope this report was found in; act in it
         time_point  started_at;
         uint64_t    query_id{0};  // PgPool query handle for cancel
     };
 
     std::unordered_map<std::string, Report> reports_;
 
-    // Pending report IDs from NOTIFY (processed in heartbeat)
-    std::vector<std::string> pending_reports_;
+    // Pending reports from NOTIFY (processed in heartbeat). The session comes with
+    // the notification — pg_notify('report', …) carries current_session() — so the
+    // scope is known without guessing which of ours it belongs to.
+    struct Pending {
+        std::string id;
+        std::string session;
+    };
+    std::vector<Pending> pending_reports_;
 
     time_point   next_check_{};
     milliseconds check_interval_{60'000};   // 1 minute
@@ -95,11 +102,14 @@ private:
 
     // -- Polling fallback -----------------------------------------------------
     void check_reports();
-    void enum_reports(std::vector<PgResult> results);
+    void enum_reports(const std::string& session, std::vector<PgResult> results);
 
     // -- Report lifecycle -----------------------------------------------------
-    void do_check(const std::string& id);
-    void do_start(const std::string& id);
+    void do_check(const std::string& session, const std::string& id);
+    void do_start(const std::string& session, const std::string& id);
+
+    /// The session a report was found under, or empty if no longer tracked.
+    std::string report_session(const std::string& id) const;
     void do_complete(const std::string& id);
     void do_abort(const std::string& id);
     void do_fail(const std::string& id, const std::string& error);
