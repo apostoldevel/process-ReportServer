@@ -241,6 +241,9 @@ void ReportServer::do_check(const std::string& session, const std::string& id)
         pq_quote_literal(use),
         pq_quote_literal(id));
 
+    // quiet: the statement carries a session code. PgPool prints statement
+    // text at debug into postgres.log — inside the container, readable
+    // by any process there.
     pool_->execute(sql,
         [this, id, use](std::vector<PgResult> results) {
             if (results.size() < 2 || !results[1].ok())
@@ -261,7 +264,8 @@ void ReportServer::do_check(const std::string& session, const std::string& id)
         },
         [this](std::string_view error) {
             on_fatal(std::string(error));
-        });
+        },
+        /*quiet=*/true);
 }
 
 // --- do_start ----------------------------------------------------------------
@@ -287,6 +291,9 @@ void ReportServer::do_start(const std::string& session, const std::string& id)
         pq_quote_literal(session),
         pq_quote_literal(id));
 
+    // quiet: the statement carries a session code. PgPool prints statement
+    // text at debug into postgres.log — inside the container, readable
+    // by any process there.
     auto qid = pool_->execute(sql,
         [this, id](std::vector<PgResult> /*results*/) {
             // rpc_* routines handle state transitions themselves
@@ -298,7 +305,8 @@ void ReportServer::do_start(const std::string& session, const std::string& id)
                 do_fail(id, std::string(error));
             else
                 delete_report(id);
-        });
+        },
+        /*quiet=*/true);
 
     // Store query handle for cancel support
     auto it = reports_.find(id);
@@ -360,6 +368,9 @@ void ReportServer::do_fail(const std::string& id, const std::string& error)
         pq_quote_literal(id), pq_quote_literal("fail"),
         pq_quote_literal(id), pq_quote_literal(error));
 
+    // quiet: the statement carries a session code. PgPool prints statement
+    // text at debug into postgres.log — inside the container, readable
+    // by any process there.
     pool_->execute(sql,
         [this, id](std::vector<PgResult> /*results*/) {
             delete_report(id);
@@ -367,7 +378,8 @@ void ReportServer::do_fail(const std::string& id, const std::string& error)
         [this, id](std::string_view err) {
             logger_->error("ReportServer: do_fail SQL error for {}: {}", id, err);
             delete_report(id);
-        });
+        },
+        /*quiet=*/true);
 }
 
 // --- execute_action ----------------------------------------------------------
