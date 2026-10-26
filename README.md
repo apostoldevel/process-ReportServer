@@ -77,6 +77,22 @@ created ──enable──► enabled ──execute──► progress ──comp
                                                    ──cancel──► canceled ──abort──► aborted
 ```
 
+One builder per report: the notify channel `report` in mode `single`
+-
+
+With several copies of the application, every ReportServer hears `NOTIFY report` and polls. When the db-platform `notify` module has the channel `report` in mode `single` (switched per installation, when every copy is new), a report to build is not a notification but a row of `notify.queue` (payload `{"session", "id"}`), handed to **one** ReportServer under a token:
+
+- a row waits in the process while `max_in_flight` reports are out; one that waited past half the channel's `lease` is given back unbuilt;
+- the report is checked with `api.get_report_ready`: `progress` → the build; `canceled` → `abort`; anything else — confirmed, nothing to build;
+- the build — `notify.hold` (the row is locked first, under its token), `statement_timeout` at 8/10 and `transaction_timeout` at 9/10 of the lease, `api.execute_report_ready` and `notify.ack` — is **one transaction**: a build longer than the lease fails as an error and is written as `fail`, never rolled back unseen after the row went to another copy. A builder whose row was handed to another is refused (`NT409`), and its build is rolled back;
+- a failed build is settled by the report's state, each with the hold and the ack: `canceled` → `abort`, `progress` → `fail` with the label, anything else — confirmed;
+- a cancel reaches a build on this path only when it ends: the routines' `complete` is refused in `canceled`, and the report is aborted;
+- there is no poll on this path: a lost wake-up is repeated by `notify.sweep`. A row closed without a confirmation is settled by the channel's `on_abandon` (`ReportReadyAbandon`).
+
+On stop ReportServer takes nothing new and gives back what is not being built yet (as `unsent:`, so the row returns to the queue); a build sent with its ack is the pool's to wait for — committed, it is confirmed; cut off by the stop, it is rolled back and its row returns by the lease.
+
+ReportServer reads the channel's mode every 10 s until it is `single`, and from then on keeps the subscriber; the notification path stays for reports requested before the switch (a copy that hears their notification builds them). The poll waits for the first answer of the probe of the `notify` module and then asks the channel's mode in the same statement, finding nothing once the channel is `single`: a report of the old path that missed its notification is not picked up after the switch. The path is not taken up — an error in the log — when the channel's `lease` is shorter than 10 s. It needs libapostol with `NotifySubscriber` (built `WITH_DB_PLATFORM`) and db-platform with `notify.hold`; without them only the notification path is built or used. After the switch the process leader gate `module.report-server.leader` is set to `false` by the installation.
+
 Database module
 -
 
